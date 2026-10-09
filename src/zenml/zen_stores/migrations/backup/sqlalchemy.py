@@ -553,6 +553,12 @@ class FileDatabaseBackupEngine(SQLAlchemyDatabaseBackupEngine):
     ) -> None:
         """Backup the database.
 
+        The backup is written to a temporary file next to the final backup
+        location and only moved into place once it is complete. A backup
+        that fails halfway therefore never leaves a partial file at the
+        final location that a later call with `overwrite=False` could
+        mistake for a complete backup.
+
         Args:
             overwrite: Whether to overwrite an existing backup if it exists.
                 If set to False, the existing backup will be reused.
@@ -567,18 +573,36 @@ class FileDatabaseBackupEngine(SQLAlchemyDatabaseBackupEngine):
 
             self.cleanup_database_backup()
 
-        if self.url.drivername == "sqlite":
-            # For a sqlite database, we can just make a copy of the database
-            # file
-            assert self.url.database is not None
-            shutil.copyfile(
-                self.url.database,
-                self.backup_location,
-            )
-            return
+        temp_backup_location = f"{self.backup_location}.tmp"
+        try:
+            if self.url.drivername == "sqlite":
+                # For a sqlite database, we can just make a copy of the
+                # database file
+                assert self.url.database is not None
+                shutil.copyfile(
+                    self.url.database,
+                    temp_backup_location,
+                )
+            else:
+                with open(temp_backup_location, "w") as f:
+                    self.backup_database_to_storage(dump_file=f)
+                    f.flush()
+                    os.fsync(f.fileno())
 
-        with open(self.backup_location, "w") as f:
-            self.backup_database_to_storage(dump_file=f)
+            # Only a complete backup ever becomes visible at the final
+            # location.
+            os.replace(temp_backup_location, self.backup_location)
+        finally:
+            # On success the temporary file has already been moved into
+            # place. Anything still here is the remainder of a failed backup.
+            if os.path.isfile(temp_backup_location):
+                try:
+                    os.remove(temp_backup_location)
+                except OSError:
+                    logger.warning(
+                        f"Failed to remove the partial database backup file "
+                        f"`{temp_backup_location}`."
+                    )
 
         logger.debug(f"Database backed up to file `{self.backup_location}`.")
 
@@ -744,6 +768,10 @@ class DBCloneDatabaseBackupEngine(BaseDatabaseBackupEngine):
         Args:
             overwrite: Whether to overwrite an existing backup if it exists.
                 If set to False, the existing backup will be reused.
+
+        Raises:
+            Exception: If copying the database into the backup database
+                fails. The partial backup database is dropped first.
         """
         if self.database_exists(database=self.backup_location):
             if not overwrite:
@@ -760,9 +788,18 @@ class DBCloneDatabaseBackupEngine(BaseDatabaseBackupEngine):
             drop=True,
         )
 
-        backup_engine = self.create_engine(database=self.backup_location)
-
-        self._copy_database(self.engine, backup_engine)
+        try:
+            backup_engine = self.create_engine(database=self.backup_location)
+            self._copy_database(self.engine, backup_engine)
+        except Exception:
+            # Drop the partial backup database so that a later call with
+            # `overwrite=False` does not mistake it for a complete backup.
+            logger.warning(
+                f"Backing up the database to `{self.backup_location}` "
+                "failed. Dropping the partial backup database."
+            )
+            self.cleanup_database_backup()
+            raise
 
         logger.debug(
             f"Database backed up to the `{self.backup_location}` backup database."

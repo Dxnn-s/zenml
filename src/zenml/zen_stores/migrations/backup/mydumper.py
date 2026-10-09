@@ -181,8 +181,11 @@ class MyDumperDatabaseBackupEngine(BaseDatabaseBackupEngine):
         current_level = get_logging_level()
         return LOGGING_LEVEL_TO_MYDUMPER_VERBOSITY.get(current_level, 2)
 
-    def _build_mydumper_command(self) -> list[str]:
+    def _build_mydumper_command(self, output_dir: str) -> list[str]:
         """Build the mydumper command for database backup.
+
+        Args:
+            output_dir: The directory that mydumper writes the backup to.
 
         Returns:
             List of command-line arguments for mydumper.
@@ -191,7 +194,7 @@ class MyDumperDatabaseBackupEngine(BaseDatabaseBackupEngine):
         cmd = ["mydumper"]
         cmd.extend(self._get_mysql_connection_args())
         cmd.extend(["--database", self.url.database])
-        cmd.extend(["--outputdir", self.backup_location])
+        cmd.extend(["--outputdir", output_dir])
         cmd.extend(["--verbose", str(self._get_mydumper_verbosity())])
 
         if self.config.auth_mode == SQLDatabaseAuthMode.AWS_RDS_IAM:
@@ -239,6 +242,12 @@ class MyDumperDatabaseBackupEngine(BaseDatabaseBackupEngine):
     ) -> None:
         """Backup the database.
 
+        mydumper writes into a temporary directory next to the final backup
+        location. The directory is only moved into place once mydumper has
+        finished successfully, so a backup that fails halfway never leaves a
+        partial backup directory that a later call with `overwrite=False`
+        could mistake for a complete backup.
+
         Args:
             overwrite: Whether to overwrite an existing backup if it exists.
                 If set to False, the existing backup will be reused.
@@ -256,9 +265,14 @@ class MyDumperDatabaseBackupEngine(BaseDatabaseBackupEngine):
 
             self.cleanup_database_backup()
 
-        os.makedirs(self.backup_location, exist_ok=True)
+        temp_backup_location = f"{self.backup_location}.tmp"
+        if os.path.isdir(temp_backup_location):
+            # Left behind by a backup that was killed before it could clean
+            # up after itself.
+            shutil.rmtree(temp_backup_location)
+        os.makedirs(temp_backup_location)
 
-        cmd = self._build_mydumper_command()
+        cmd = self._build_mydumper_command(output_dir=temp_backup_location)
 
         logger.info(
             f"Starting mydumper backup of database `{self.url.database}` "
@@ -266,25 +280,35 @@ class MyDumperDatabaseBackupEngine(BaseDatabaseBackupEngine):
         )
         logger.debug(f"mydumper command: {cmd}")
 
-        process = subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            env=self._get_mysql_env(),
-        )
-
-        assert process.stdout is not None
-        for line in process.stdout:
-            line = line.rstrip()
-            if line:
-                logger.info(f"[mydumper] {line}")
-
-        return_code = process.wait()
-        if return_code != 0:
-            raise RuntimeError(
-                f"mydumper backup failed with return code {return_code}"
+        try:
+            process = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                env=self._get_mysql_env(),
             )
+
+            assert process.stdout is not None
+            for line in process.stdout:
+                line = line.rstrip()
+                if line:
+                    logger.info(f"[mydumper] {line}")
+
+            return_code = process.wait()
+            if return_code != 0:
+                raise RuntimeError(
+                    f"mydumper backup failed with return code {return_code}"
+                )
+
+            # Only a complete backup ever becomes visible at the final
+            # location.
+            os.replace(temp_backup_location, self.backup_location)
+        finally:
+            # On success the temporary directory has already been moved into
+            # place. Anything still here is the remainder of a failed backup.
+            if os.path.isdir(temp_backup_location):
+                shutil.rmtree(temp_backup_location, ignore_errors=True)
 
         logger.info(
             f"Database `{self.url.database}` successfully backed up "
